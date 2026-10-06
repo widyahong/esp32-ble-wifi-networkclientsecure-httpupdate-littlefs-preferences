@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ESP32 OTA</title>
+</head>
+<body>
+
+<h3>Bluetooth</h3>
+<button onclick="connectBLE()">Connect Bluetooth</button>
+
+<h3>WiFi</h3>
+SSID:<br>
+<input id="ssid" type="text"><br><br>
+Password:<br>
+<input id="pass" type="password"><br><br>
+<button onclick="sendWifi()">Send WiFi</button>
+
+<h3>OTA Update</h3>
+<button onclick="sendUpdate('APP')">Update App</button>
+<button onclick="sendUpdate('DATA')">Update Data</button>
+<button onclick="sendUpdate('NVS')">Update NVS</button>
+
+<h3>Monitor</h3>
+<textarea id="monitor" rows="8" cols="64" readonly></textarea><br>
+<button onclick="readPartition('DATA')">Read Data</button>
+<button onclick="readPartition('NVS')">Read NVS</button>
+
+<h3>Command</h3>
+<textarea id="cmd" rows="8" cols="64"></textarea><br>
+<button onclick="writePartition('DATA')">Write Data</button>
+<button onclick="writePartition('NVS')">Write NVS</button>
+<button onclick="sendRaw()">Send Command</button>
+
+<script>
+const SERVICE_UUID = "0000aaaa-0000-1000-8000-00805f9b34fb";
+const CHAR_UUID    = "0000bbbb-0000-1000-8000-00805f9b34fb";
+const CHUNK_SIZE   = 20; // matches BLE default MTU payload (~20 bytes)
+
+let bleDevice = null;
+let bleChar = null;
+
+// --- read state (device -> browser, request-per-chunk) ---
+// readPartitionTag is which partition's NEXT command to send ('DATA' or 'NVS');
+// only one read is expected to be active at a time.
+let readActive       = false;
+let readPartitionTag = null;
+let readExpected     = 0;
+let readReceived     = 0;
+let readDecoder      = null; // persists across chunks so split multi-byte chars decode correctly
+
+function log(msg) {
+  const box = document.getElementById("monitor");
+  box.value += msg + "\n";
+  box.scrollTop = box.scrollHeight;
+}
+
+// Appends with no "\n" and no separator of any kind - used to stream raw
+// write/read content into the monitor chunk-by-chunk, as it happens, so it
+// reads like the actual bytes landing live rather than a log line.
+function logRaw(text) {
+  const box = document.getElementById("monitor");
+  box.value += text;
+  box.scrollTop = box.scrollHeight;
+}
+
+async function connectBLE() {
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }]
+    });
+    const server = await bleDevice.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    bleChar = await service.getCharacteristic(CHAR_UUID);
+
+    await bleChar.startNotifications();
+    bleChar.addEventListener("characteristicvaluechanged", handleNotify);
+
+    log("[BLE] Connected");
+  } catch (err) {
+    log("[BLE] Error: " + err);
+  }
+}
+
+// Raw text write (WIFI:, UPDATE:.., DATA:.., NVS:.., echo...)
+// writeValueWithResponse gives us free flow control: it resolves only after the
+// device has acked the write, so awaiting it in a loop paces chunk delivery.
+async function bleWriteText(text) {
+  if (!bleChar) { log("[BLE] Not connected"); return; }
+  await bleChar.writeValueWithResponse(new TextEncoder().encode(text));
+}
+
+// Raw binary write, chunked to CHUNK_SIZE, awaited sequentially. Streams
+// each chunk straight into the monitor as it's sent - {stream: true} keeps
+// a multi-byte UTF-8 character that happens to land across two chunks from
+// coming out garbled.
+async function bleWriteBytes(bytes) {
+  if (!bleChar) { log("[BLE] Not connected"); return; }
+  const decoder = new TextDecoder();
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    const chunk = bytes.slice(i, i + CHUNK_SIZE);
+    await bleChar.writeValueWithResponse(chunk);
+    logRaw(decoder.decode(chunk, { stream: true }));
+  }
+  logRaw(decoder.decode()); // flush any leftover partial sequence
+}
+
+function sendWifi() {
+  const ssid = document.getElementById("ssid").value;
+  const pass = document.getElementById("pass").value;
+  bleWriteText("WIFI:" + ssid + "|" + pass);
+  log("[SENT] WIFI credentials");
+}
+
+// partition: 'APP' | 'DATA' | 'NVS'
+function sendUpdate(partition) {
+  bleWriteText("UPDATE:" + partition);
+  log("[SENT] UPDATE:" + partition);
+}
+
+function sendRaw() {
+  const cmd = document.getElementById("cmd").value;
+  bleWriteText(cmd);
+  log("[SENT] " + cmd);
+}
+
+// --- Write DATA/NVS: takes whatever is in the Command box, sends it as the new blob ---
+// partition: 'DATA' | 'NVS'
+async function writePartition(partition) {
+  const text = document.getElementById("cmd").value;
+  const bytes = new TextEncoder().encode(text);
+
+  await bleWriteText(partition + ":WRITE:" + bytes.length);
+  log("[SENT] " + partition + ":WRITE:" + bytes.length);
+
+  await bleWriteBytes(bytes);
+  log("\n[" + partition + "] write sent, " + bytes.length + " bytes");
+}
+
+// --- Read DATA/NVS: kicks off the SIZE -> NEXT/chunk loop; result lands in Monitor ---
+// partition: 'DATA' | 'NVS'
+async function readPartition(partition) {
+  readPartitionTag = partition;
+  await bleWriteText(partition + ":READ");
+  log("[SENT] " + partition + ":READ");
+}
+
+async function requestNextChunk() {
+  await bleWriteText(readPartitionTag + ":NEXT");
+}
+
+function finishRead() {
+  readActive = false;
+  logRaw(readDecoder.decode()); // flush any leftover partial sequence
+  readDecoder = null;
+  log("\n[" + readPartitionTag + "] read done, " + readReceived + " bytes");
+}
+
+function handleNotify(e) {
+  const value = e.target.value; // DataView
+  const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+
+  if (!readActive) {
+    const text = new TextDecoder().decode(bytes);
+    if (text.startsWith("SIZE:")) {
+      readExpected = parseInt(text.slice(5), 10) || 0;
+      readReceived = 0;
+      readDecoder = new TextDecoder();
+      log("[" + readPartitionTag + "] reading, size=" + readExpected);
+      if (readExpected === 0) {
+        log("[" + readPartitionTag + "] read done, 0 bytes");
+        readDecoder = null;
+        return;
+      }
+      readActive = true;
+      requestNextChunk();
+      return;
+    }
+    log(text); // normal log line / echo
+    return;
+  }
+
+  // readActive: this notification is a raw chunk, not a log line - stream
+  // it straight into the monitor as it arrives instead of buffering it
+  readReceived += bytes.length;
+  logRaw(readDecoder.decode(bytes, { stream: true }));
+  if (readReceived < readExpected) {
+    requestNextChunk();
+  } else {
+    finishRead();
+  }
+}
+
+</script>
+</body>
+</html>
