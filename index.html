@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ESP32 OTA</title>
+</head>
+<body>
+
+<h3>Bluetooth</h3>
+<button onclick="connectBLE()">Connect Bluetooth</button>
+
+<h3>WiFi</h3>
+SSID:<br>
+<input id="ssid" type="text"><br><br>
+Password:<br>
+<input id="pass" type="password"><br><br>
+<button onclick="sendWifi()">Send WiFi</button>
+
+<h3>OTA Update</h3>
+URL prefix:<br>
+<input id="otaPrefix" type="text" size="64"><br><br>
+<button onclick="sendUpdate('APP')">Update App</button>
+<button onclick="sendUpdate('DATA')">Update Data</button>
+<button onclick="sendUpdate('NVS')">Update NVS</button>
+
+<h3>Serial</h3>
+<button onclick="connectSerial()">Connect Serial</button>
+
+<h3>Serial Update</h3>
+Full URL:<br>
+<input id="serialUrl" type="text" size="64"><br><br>
+<button onclick="serialUpdateApp()">Update App</button>
+
+<h3>Monitor</h3>
+<textarea id="monitor" rows="8" cols="64" readonly></textarea><br>
+<button onclick="readPartition('DATA')">Read Data</button>
+<button onclick="readPartition('NVS')">Read NVS</button>
+
+<h3>Command</h3>
+<textarea id="cmd" rows="8" cols="64"></textarea><br>
+<button onclick="writePartition('DATA')">Write Data</button>
+<button onclick="writePartition('NVS')">Write NVS</button>
+<button onclick="sendRaw()">Send Command</button>
+
+<script type="module">
+// Web Serial flasher (esptool-js, single-file bundle).
+// Writes the Arduino IDE app .bin to the app0 slot, then blanks otadata so the
+// bootloader falls back to booting that slot. Adjust if you use a custom
+// partition table.
+// The port is picked by connectSerial() (a button click = user gesture, which
+// requestPort() requires). This function only reuses that port.
+const ESPTOOL_BUNDLE = "https://unpkg.com/esptool-js/bundle.js";
+const APP_ADDRESS     = 0x10000; // app0 (ota_0) in the default Arduino partition tables
+const OTADATA_ADDRESS = 0xE000;  // otadata
+const OTADATA_SIZE    = 0x2000;
+const SERIAL_FLASH_BAUD = 460800;
+
+window.serialUpdateApp = async function () {
+  const url = document.getElementById("serialUrl").value.trim();
+  if (!url) { log("[SERIAL] URL is empty"); return; }
+  if (!serialPort) { log("[SERIAL] Connect Serial first"); return; }
+  const port = serialPort;
+
+  let transport = null;
+  try {
+    // 1. Fetch the firmware in the browser first (needs CORS allowed by the server)
+    log("[SERIAL] fetching " + url);
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const appData = new Uint8Array(await res.arrayBuffer());
+    if (appData.length === 0 || appData[0] !== 0xE9) {
+      throw new Error("not an ESP32 app image (bad magic byte)");
+    }
+    log("[SERIAL] fetched " + appData.length + " bytes");
+
+    // 2. Load esptool-js, release the port from the monitor so esptool can open it
+    const mod = await import(ESPTOOL_BUNDLE);
+    const { ESPLoader, Transport } = mod.ESPLoader ? mod : (window.esptooljs || mod);
+
+    await closeSerial();
+    transport = new Transport(port, true);
+    const esploader = new ESPLoader({
+      transport,
+      baudrate: SERIAL_FLASH_BAUD,
+      terminal: {
+        clean() {},
+        writeLine(d) { log(d); },
+        write(d) { logRaw(d); }
+      }
+    });
+
+    const chip = await esploader.main();
+    log("[SERIAL] connected: " + chip);
+
+    // 3. Flash app, and blank otadata so the new image is the one that boots
+    const blankOtadata = new Uint8Array(OTADATA_SIZE).fill(0xFF);
+    let lastPct = -1;
+    await esploader.writeFlash({
+      fileArray: [
+        { data: appData,      address: APP_ADDRESS },
+        { data: blankOtadata, address: OTADATA_ADDRESS }
+      ],
+      flashMode: "keep",
+      flashFreq: "keep",
+      flashSize: "keep",
+      eraseAll: false,
+      compress: true,
+      reportProgress: (idx, written, total) => {
+        const pct = Math.floor(written / total * 10) * 10;
+        if (idx === 0 && pct !== lastPct) { lastPct = pct; log("[SERIAL] app " + pct + "%"); }
+      }
+    });
+
+    await esploader.after("hard_reset");
+    log("[SERIAL] done, device rebooting");
+  } catch (err) {
+    log("[SERIAL] Error: " + err);
+  } finally {
+    try { if (transport) await transport.disconnect(); } catch (e) {}
+    // give the monitor back its port (also after a failure)
+    if (!serialPort) {
+      try { await openSerial(port); } catch (e) { log("[SERIAL] reopen failed: " + e); }
+    }
+  }
+};
+</script>
+
+<script>
+const SERVICE_UUID = "0000aaaa-0000-1000-8000-00805f9b34fb";
+const CHAR_UUID    = "0000bbbb-0000-1000-8000-00805f9b34fb";
+const CHUNK_SIZE   = 20; // matches BLE default MTU payload (~20 bytes)
+
+let bleDevice = null;
+let bleChar = null;
+
+// --- read state (device -> browser, request-per-chunk) ---
+// readPartitionTag is which partition's NEXT command to send ('DATA' or 'NVS');
+// only one read is expected to be active at a time.
+let readActive       = false;
+let readPartitionTag = null;
+let readExpected     = 0;
+let readReceived     = 0;
+let readDecoder      = null; // persists across chunks so split multi-byte chars decode correctly
+
+function log(msg) {
+  const box = document.getElementById("monitor");
+  box.value += msg + "\n";
+  box.scrollTop = box.scrollHeight;
+}
+
+// Appends with no "\n" and no separator of any kind - used to stream raw
+// write/read content into the monitor chunk-by-chunk, as it happens, so it
+// reads like the actual bytes landing live rather than a log line.
+function logRaw(text) {
+  const box = document.getElementById("monitor");
+  box.value += text;
+  box.scrollTop = box.scrollHeight;
+}
+
+// --- Serial (Web Serial): monitor + command alongside BLE ---
+// connectSerial() is called straight from a button click, so requestPort()
+// still has its user gesture. Incoming bytes go raw into the Monitor; writes
+// from the Command box / buttons go out over every connected link (BLE
+// and/or serial). Using both at once is not coordinated - the firmware does
+// not arbitrate between them.
+const SERIAL_MONITOR_BAUD = 115200; // matches SERIAL_BAUD_RATE in the firmware
+let serialPort    = null;
+let serialWriter  = null;
+let serialReader  = null;
+let serialReading = false;
+let serialLoop    = null;
+let serialDecoder = null;
+
+async function connectSerial() {
+  if (!("serial" in navigator)) { log("[SERIAL] Web Serial not supported"); return; }
+  try {
+    const port = await navigator.serial.requestPort(); // must be the first await
+    await closeSerial();
+    await openSerial(port);
+  } catch (err) {
+    log("[SERIAL] Error: " + err);
+  }
+}
+
+async function openSerial(port) {
+  await port.open({ baudRate: SERIAL_MONITOR_BAUD });
+  serialPort    = port;
+  serialWriter  = port.writable.getWriter();
+  serialDecoder = new TextDecoder(); // persists across reads, handles split multi-byte chars
+  serialReading = true;
+  serialLoop    = serialReadLoop(port);
+  log("[SERIAL] Connected");
+}
+
+async function serialReadLoop(port) {
+  try {
+    while (serialReading && port.readable) {
+      serialReader = port.readable.getReader();
+      try {
+        while (true) {
+          const { value, done } = await serialReader.read();
+          if (done) break;
+          if (value) logRaw(serialDecoder.decode(value, { stream: true }));
+        }
+      } finally {
+        serialReader.releaseLock();
+        serialReader = null;
+      }
+    }
+  } catch (err) {
+    if (serialReading) log("[SERIAL] read error: " + err);
+  }
+  if (serialReading) { // ended on its own (unplugged), not via closeSerial()
+    log("[SERIAL] Disconnected");
+    closeSerial();
+  }
+}
+
+async function closeSerial() {
+  if (!serialPort) return;
+  const port = serialPort;
+  serialPort    = null;
+  serialReading = false;
+  try { if (serialReader) await serialReader.cancel(); } catch (e) {}
+  try { if (serialLoop) await serialLoop; } catch (e) {}
+  try { if (serialWriter) { serialWriter.releaseLock(); } } catch (e) {}
+  serialWriter = null;
+  serialLoop   = null;
+  try { await port.close(); } catch (e) {}
+}
+
+async function connectBLE() {
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }]
+    });
+    const server = await bleDevice.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    bleChar = await service.getCharacteristic(CHAR_UUID);
+
+    await bleChar.startNotifications();
+    bleChar.addEventListener("characteristicvaluechanged", handleNotify);
+
+    log("[BLE] Connected");
+  } catch (err) {
+    log("[BLE] Error: " + err);
+  }
+}
+
+// Raw text write (WIFI:, UPDATE:.., DATA:.., NVS:.., echo...)
+// BLE: writeValueWithResponse gives us free flow control: it resolves only after
+// the device has acked the write, so awaiting it in a loop paces chunk delivery.
+// Serial: the same text goes out followed by "\n" (line-terminated commands).
+// Goes to every connected link.
+async function sendText(text) {
+  if (!bleChar && !serialWriter) { log("[LINK] Not connected (BLE or Serial)"); return; }
+  if (bleChar)      await bleChar.writeValueWithResponse(new TextEncoder().encode(text));
+  if (serialWriter) await serialWriter.write(new TextEncoder().encode(text + "\n"));
+}
+
+// Raw binary write, chunked to CHUNK_SIZE, awaited sequentially. Streams
+// each chunk straight into the monitor as it's sent - {stream: true} keeps
+// a multi-byte UTF-8 character that happens to land across two chunks from
+// coming out garbled.
+async function sendBytes(bytes) {
+  if (!bleChar && !serialWriter) { log("[LINK] Not connected (BLE or Serial)"); return; }
+  const decoder = new TextDecoder();
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    const chunk = bytes.slice(i, i + CHUNK_SIZE);
+    if (bleChar)      await bleChar.writeValueWithResponse(chunk);
+    if (serialWriter) await serialWriter.write(chunk);
+    logRaw(decoder.decode(chunk, { stream: true }));
+  }
+  logRaw(decoder.decode()); // flush any leftover partial sequence
+}
+
+function sendWifi() {
+  const ssid = document.getElementById("ssid").value;
+  const pass = document.getElementById("pass").value;
+  sendText("WIFI:" + ssid + "|" + pass);
+  log("[SENT] WIFI credentials");
+}
+
+// partition: 'APP' | 'DATA' | 'NVS'
+// If the prefix box is filled, it is sent as plain text after "|" and
+// overrides the firmware's built-in prefix for this one update only.
+function sendUpdate(partition) {
+  const prefix = document.getElementById("otaPrefix").value.trim();
+  const cmd = "UPDATE:" + partition + (prefix ? "|" + prefix : "");
+  sendText(cmd);
+  log("[SENT] " + cmd);
+}
+
+function sendRaw() {
+  const cmd = document.getElementById("cmd").value;
+  sendText(cmd);
+  log("[SENT] " + cmd);
+}
+
+// --- Write DATA/NVS: takes whatever is in the Command box, sends it as the new blob ---
+// partition: 'DATA' | 'NVS'
+async function writePartition(partition) {
+  const text = document.getElementById("cmd").value;
+  const bytes = new TextEncoder().encode(text);
+
+  await sendText(partition + ":WRITE:" + bytes.length);
+  log("[SENT] " + partition + ":WRITE:" + bytes.length);
+
+  await sendBytes(bytes);
+  log("\n[" + partition + "] write sent, " + bytes.length + " bytes");
+}
+
+// --- Read DATA/NVS: kicks off the SIZE -> NEXT/chunk loop; result lands in Monitor ---
+// partition: 'DATA' | 'NVS'
+async function readPartition(partition) {
+  readPartitionTag = partition;
+  await sendText(partition + ":READ");
+  log("[SENT] " + partition + ":READ");
+}
+
+async function requestNextChunk() {
+  await sendText(readPartitionTag + ":NEXT");
+}
+
+function finishRead() {
+  readActive = false;
+  logRaw(readDecoder.decode()); // flush any leftover partial sequence
+  readDecoder = null;
+  log("\n[" + readPartitionTag + "] read done, " + readReceived + " bytes");
+}
+
+function handleNotify(e) {
+  const value = e.target.value; // DataView
+  const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+
+  if (!readActive) {
+    const text = new TextDecoder().decode(bytes);
+    if (text.startsWith("SIZE:")) {
+      readExpected = parseInt(text.slice(5), 10) || 0;
+      readReceived = 0;
+      readDecoder = new TextDecoder();
+      log("[" + readPartitionTag + "] reading, size=" + readExpected);
+      if (readExpected === 0) {
+        log("[" + readPartitionTag + "] read done, 0 bytes");
+        readDecoder = null;
+        return;
+      }
+      readActive = true;
+      requestNextChunk();
+      return;
+    }
+    log(text); // normal log line / echo
+    return;
+  }
+
+  // readActive: this notification is a raw chunk, not a log line - stream
+  // it straight into the monitor as it arrives instead of buffering it
+  readReceived += bytes.length;
+  logRaw(readDecoder.decode(bytes, { stream: true }));
+  if (readReceived < readExpected) {
+    requestNextChunk();
+  } else {
+    finishRead();
+  }
+}
+
+</script>
+</body>
+</html>
