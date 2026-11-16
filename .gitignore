@@ -1,0 +1,12 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# Arduino IDE
+*.hex
+*.bin
+build/
+
+# OS junk
+.DS_Store
+Thumbs.db
